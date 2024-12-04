@@ -28,7 +28,8 @@ async function loadUrls(locale) {
 }
 
 async function crawlSites(sites) {
-    const results = [];
+    // Group results by schema type
+    const resultsByType = new Map();
     
     for (const site of sites) {
         try {
@@ -36,51 +37,40 @@ async function crawlSites(sites) {
             const response = await axios.get(site);
             const $ = cheerio.load(response.data);
             
-            // Find all script tags with type="application/ld+json"
             const schemaScripts = $('script[type="application/ld+json"]');
             
             if (schemaScripts.length === 0) {
-                // If no schema found, add a record with just the URL
-                results.push({
+                addToResults(resultsByType, 'NoSchema', {
                     sourceUrl: site,
                     schemaFound: false,
                     errorMessage: 'No schema markup found'
                 });
-                console.log(`No schema found for ${site}`);
                 continue;
             }
             
-            let schemaFoundForSite = false;
             schemaScripts.each((_, element) => {
                 try {
-                    const schemaText = $(element).html();
-                    const schema = JSON.parse(schemaText);
+                    const schema = JSON.parse($(element).html());
+                    const schemaType = getSchemaType(schema);
                     
-                    // Flatten the schema object for CSV
-                    const flattened = flattenObject(schema);
-                    // Ensure primary fields come first by creating a new object with desired order
-                    const orderedData = {
+                    const flattened = {
                         sourceUrl: site,
                         schemaFound: true,
                         errorMessage: '',
-                        ...flattened  // Spread the rest of the flattened data after our primary fields
+                        ...flattenObject(schema)
                     };
-                    results.push(orderedData);
-                    schemaFoundForSite = true;
+                    
+                    addToResults(resultsByType, schemaType, flattened);
                 } catch (parseError) {
-                    console.error(`Error parsing schema for ${site}:`, parseError.message);
-                    if (!schemaFoundForSite) {
-                        results.push({
-                            sourceUrl: site,
-                            schemaFound: false,
-                            errorMessage: `Parse error: ${parseError.message}`
-                        });
-                    }
+                    addToResults(resultsByType, 'ParseError', {
+                        sourceUrl: site,
+                        schemaFound: false,
+                        errorMessage: `Parse error: ${parseError.message}`
+                    });
                 }
             });
         } catch (error) {
-            console.error(`Error crawling ${site}:`, error.message);
-            results.push({
+            addToResults(resultsByType, 'CrawlError', {
                 sourceUrl: site,
                 schemaFound: false,
                 errorMessage: `Crawl error: ${error.message}`
@@ -88,7 +78,54 @@ async function crawlSites(sites) {
         }
     }
     
-    return results;
+    return resultsByType;
+}
+
+function getSchemaType(schema) {
+    const type = schema['@type'];
+    if (!type) return 'UnknownType';
+    return Array.isArray(type) ? type[0] : type;
+}
+
+function addToResults(resultsByType, type, data) {
+    if (!resultsByType.has(type)) {
+        resultsByType.set(type, []);
+    }
+    resultsByType.get(type).push(data);
+}
+
+async function saveResultsByType(locale, resultsByType) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const outputDir = path.join('./output', locale, timestamp);
+    await fs.mkdir(outputDir, { recursive: true });
+    
+    const summary = {
+        totalUrls: 0,
+        typeBreakdown: {}
+    };
+    
+    for (const [type, results] of resultsByType.entries()) {
+        if (results.length === 0) continue;
+        
+        const fields = ['sourceUrl', 'schemaFound', 'errorMessage', 
+            ...new Set(results.flatMap(obj => Object.keys(obj)))
+        ];
+        
+        const csv = parse(results, { fields });
+        const filename = path.join(outputDir, `${type}.csv`);
+        await fs.writeFile(filename, csv);
+        
+        summary.totalUrls += results.length;
+        summary.typeBreakdown[type] = results.length;
+    }
+    
+    // Save summary
+    await fs.writeFile(
+        path.join(outputDir, 'summary.json'),
+        JSON.stringify(summary, null, 2)
+    );
+    
+    return { outputDir, summary };
 }
 
 // Helper function to flatten nested objects
@@ -113,50 +150,19 @@ function flattenObject(obj, prefix = '') {
 
 async function main() {
     try {
-        // Load URLs for the specified locale
         const sites = await loadUrls(locale);
         console.log(`Loaded ${sites.length} URLs for locale: ${locale}`);
         
-        // Crawl sites and get schema data
-        const results = await crawlSites(sites);
+        const resultsByType = await crawlSites(sites);
+        const { outputDir, summary } = await saveResultsByType(locale, resultsByType);
         
-        if (results.length === 0) {
-            console.log('No data collected.');
-            return;
-        }
-        
-        // Get all unique field names and order them
-        const primaryFields = ['sourceUrl', 'schemaFound', 'errorMessage'];
-        const otherFields = Array.from(new Set(results.flatMap(obj => Object.keys(obj))))
-            .filter(key => !primaryFields.includes(key));
-        
-        // Set up CSV parser options with field order
-        const csvOptions = {
-            header: true,
-            fields: [...primaryFields, ...otherFields]
-        };
-        
-        // Convert to CSV with ordered fields
-        const csv = parse(results, csvOptions);
-        
-        // Create output directory if it doesn't exist
-        const outputDir = './output';
-        await fs.mkdir(outputDir, { recursive: true });
-        
-        // Save to file with locale and timestamp
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const filename = path.join(outputDir, `${locale}_schema_data_${timestamp}.csv`);
-        await fs.writeFile(filename, csv);
-        
-        console.log(`Successfully saved data to ${filename}`);
-        
-        // Log summary
-        const sitesWithSchema = results.filter(r => r.schemaFound).length;
-        const sitesWithoutSchema = results.filter(r => !r.schemaFound).length;
+        console.log(`\nResults saved to: ${outputDir}`);
         console.log('\nSummary:');
-        console.log(`Total URLs processed: ${results.length}`);
-        console.log(`URLs with schema: ${sitesWithSchema}`);
-        console.log(`URLs without schema: ${sitesWithoutSchema}`);
+        console.log(`Total URLs processed: ${summary.totalUrls}`);
+        console.log('\nBreakdown by schema type:');
+        Object.entries(summary.typeBreakdown)
+            .forEach(([type, count]) => console.log(`${type}: ${count}`));
+            
     } catch (error) {
         console.error('Error in main process:', error);
         process.exit(1);
